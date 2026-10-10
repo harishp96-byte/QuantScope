@@ -506,6 +506,14 @@ class StockAnalyzer:
         # Simple Moving Averages
         data['SMA_20'] = data['Close'].rolling(window=20).mean()
         data['SMA_50'] = data['Close'].rolling(window=50).mean()
+        data['SMA_200'] = data['Close'].rolling(window=200).mean()
+
+        # MACD (12, 26, 9)
+        ema_12 = data['Close'].ewm(span=12, adjust=False).mean()
+        ema_26 = data['Close'].ewm(span=26, adjust=False).mean()
+        data['MACD'] = ema_12 - ema_26
+        data['MACD_Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+        data['MACD_Hist'] = data['MACD'] - data['MACD_Signal']
 
         # RSI calculation (14-period)
         delta = data['Close'].diff()
@@ -540,6 +548,12 @@ class StockAnalyzer:
             x=data.index, y=data['SMA_50'],
             name='SMA 50', line=dict(color='#d62728', dash='dash')
         ))
+
+        if data['SMA_200'].notna().any():
+            fig.add_trace(go.Scatter(
+                x=data.index, y=data['SMA_200'],
+                name='SMA 200', line=dict(color='#2ca02c', width=2)
+            ))
 
         fig.add_trace(go.Scatter(
             x=data.index, y=data['BB_Upper'],
@@ -589,6 +603,51 @@ class StockAnalyzer:
 
         return fig
 
+    def create_macd_chart(self, data: pd.DataFrame, symbol: str) -> go.Figure:
+        """Create MACD (12, 26, 9) chart."""
+        fig = go.Figure()
+        colors = ['#2ca02c' if v >= 0 else '#d62728' for v in data['MACD_Hist'].fillna(0)]
+        fig.add_trace(go.Bar(x=data.index, y=data['MACD_Hist'], name='Histogram', marker_color=colors))
+        fig.add_trace(go.Scatter(x=data.index, y=data['MACD'], name='MACD', line=dict(color='#1f77b4', width=2)))
+        fig.add_trace(go.Scatter(x=data.index, y=data['MACD_Signal'], name='Signal', line=dict(color='#ff7f0e', width=2)))
+        fig.add_hline(y=0, line_dash="dot", line_color="gray")
+        fig.update_layout(
+            title=f'{symbol} MACD (12, 26, 9)',
+            xaxis_title='Date',
+            template='plotly_white',
+            height=320,
+            legend=dict(orientation='h', y=-0.25)
+        )
+        return fig
+
+    def create_relative_strength_chart(self, data: pd.DataFrame, symbol: str) -> go.Figure:
+        """Stock vs Nifty 50, both rebased to 100 at the start of the period."""
+        fig = go.Figure()
+        stock = data['Close'] / data['Close'].iloc[0] * 100
+        bench = data['Nifty'] / data['Nifty'].dropna().iloc[0] * 100
+        fig.add_trace(go.Scatter(x=data.index, y=stock, name=symbol, line=dict(color='#1f77b4', width=2)))
+        fig.add_trace(go.Scatter(x=data.index, y=bench, name='Nifty 50', line=dict(color='gray', width=2, dash='dash')))
+        fig.update_layout(
+            title=f'{symbol} vs Nifty 50 (rebased to 100)',
+            xaxis_title='Date',
+            template='plotly_white',
+            height=350,
+            legend=dict(orientation='h', y=-0.25)
+        )
+        return fig
+
+    def add_relative_strength(self, data: pd.DataFrame, period: str) -> pd.DataFrame:
+        """Attach Nifty 50 closes (Indian stocks only)."""
+        nifty, err = self.fetch_stock_data('^NSEI', period)
+        if err or nifty is None or nifty.empty:
+            return data
+        data = data.copy()
+        n = nifty['Close'].copy()
+        n.index = n.index.normalize().tz_localize(None)
+        idx = data.index.normalize().tz_localize(None)
+        data['Nifty'] = n.reindex(idx).ffill().values
+        return data
+
     def calculate_metrics(self, data: pd.DataFrame, currency_symbol: str) -> Dict[str, str]:
         """Calculate key financial metrics from stock data."""
         if data.empty:
@@ -617,6 +676,20 @@ class StockAnalyzer:
 
         if current_rsi is not None:
             metrics['Current RSI'] = f"{current_rsi:.1f}"
+
+        last = data.iloc[-1]
+        if 'SMA_200' in data.columns and pd.notna(last.get('SMA_200')):
+            gap = (current_price / last['SMA_200'] - 1) * 100
+            metrics['vs 200 DMA'] = f"{gap:+.1f}% ({'above' if gap >= 0 else 'below'})"
+            if pd.notna(last.get('SMA_50')):
+                metrics['Trend'] = "Uptrend (50>200)" if last['SMA_50'] > last['SMA_200'] else "Downtrend (50<200)"
+        if 'MACD' in data.columns and pd.notna(last.get('MACD')):
+            metrics['MACD Signal'] = "Bullish" if last['MACD'] > last['MACD_Signal'] else "Bearish"
+        if 'Nifty' in data.columns and data['Nifty'].notna().sum() > 1:
+            nifty = data['Nifty'].dropna()
+            stock_ret = (current_price / start_price - 1) * 100
+            nifty_ret = (nifty.iloc[-1] / nifty.iloc[0] - 1) * 100
+            metrics['vs Nifty'] = f"{stock_ret - nifty_ret:+.1f} pts"
 
         return metrics
 
@@ -727,9 +800,19 @@ def process_stock_analysis(
             st.error(f"No data available for {symbol}")
             return False
 
-        # Calculate technical indicators
+        # Calculate indicators on 2 years of history so the 200-day average
+        # and MACD are valid from the first visible day, then trim back.
+        start = data.index[0]
+        if period != 'max':
+            warm, warm_err = analyzer.fetch_stock_data(symbol, '2y')
+            if not warm_err and warm is not None and len(warm) > len(data):
+                data = warm
         data = analyzer.create_technical_indicators(data)
-        
+        data = data[data.index >= start]
+
+        if symbol.endswith('.NS') or symbol.endswith('.BO'):
+            data = analyzer.add_relative_strength(data, period)
+
         market_config = MarketRegistry.get_market_config(market)
         currency_symbol = market_config.currency if market_config else '$'
         
@@ -794,8 +877,21 @@ def display_stock_analysis(analyzer: StockAnalyzer, symbol: str) -> None:
                 signal = "Neutral"
             st.metric("RSI Signal", signal)
 
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Trend", metrics.get('Trend', 'N/A'))
+    with col2:
+        st.metric("vs 200 DMA", metrics.get('vs 200 DMA', 'N/A'))
+    with col3:
+        st.metric("MACD Signal", metrics.get('MACD Signal', 'N/A'))
+    with col4:
+        st.metric("vs Nifty", metrics.get('vs Nifty', 'N/A'))
+    st.caption("Indicators are probabilistic signals, not predictions. Not investment advice.")
+
     # Charts in tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["Price Chart", "Technical Analysis", "RSI", "Volume"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Price Chart", "Technical Analysis", "RSI", "MACD", "vs Nifty", "Volume"]
+    )
 
     with tab1:
         price_chart = analyzer.create_price_chart(data, symbol, chart_type)
@@ -810,6 +906,15 @@ def display_stock_analysis(analyzer: StockAnalyzer, symbol: str) -> None:
         st.plotly_chart(rsi_chart, use_container_width=True)
 
     with tab4:
+        st.plotly_chart(analyzer.create_macd_chart(data, symbol), use_container_width=True)
+
+    with tab5:
+        if 'Nifty' in data.columns and data['Nifty'].notna().sum() > 1:
+            st.plotly_chart(analyzer.create_relative_strength_chart(data, symbol), use_container_width=True)
+        else:
+            st.info("Nifty comparison is available for Indian (NSE/BSE) stocks only.")
+
+    with tab6:
         volume_chart = analyzer.create_volume_chart(data, symbol)
         st.plotly_chart(volume_chart, use_container_width=True)
 
@@ -885,7 +990,7 @@ def main() -> None:
         col1, col2 = st.columns(2)
         with col1:
             chart_type = st.selectbox("Chart Type", ["line", "candlestick"], index=0)
-            manual_period = st.selectbox("Manual Period", ["1d", "1mo", "3mo", "6mo", "1y", "ytd"], index=2)
+            manual_period = st.selectbox("Manual Period", ["1d", "1mo", "3mo", "6mo", "1y", "2y", "ytd"], index=2)
         with col2:
             manual_symbol = st.text_input("Manual Symbol", placeholder="e.g., AAPL")
             manual_analyze = st.button("Analyze Manual Input")
